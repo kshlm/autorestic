@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,6 +24,8 @@ const (
 	TypeLocal  LocationType = "local"
 	TypeVolume LocationType = "volume"
 )
+
+var incompatibleCopySourceTarget = []string{"b2", "azure", "gs", "s3", "swift"}
 
 type HookArray = []string
 
@@ -100,18 +104,23 @@ func (l Location) validate() error {
 
 	// Check copy option
 	for copyFrom, copyTo := range l.CopyOption {
-		if _, ok := GetBackend(copyFrom); !ok {
+		fromBackend, ok := GetBackend(copyFrom)
+		if !ok {
 			return fmt.Errorf(`location "%s" has an invalid backend "%s" in copy option`, l.name, copyFrom)
 		}
 		if !ArrayContains(l.To, copyFrom) {
 			return fmt.Errorf(`location "%s" has an invalid copy from "%s"`, l.name, copyFrom)
 		}
 		for _, copyToTarget := range copyTo {
-			if _, ok := GetBackend(copyToTarget); !ok {
+			toBackend, ok := GetBackend(copyToTarget)
+			if !ok {
 				return fmt.Errorf(`location "%s" has an invalid backend "%s" in copy option`, l.name, copyToTarget)
 			}
 			if ArrayContains(l.To, copyToTarget) {
 				return fmt.Errorf(`location "%s" cannot copy to "%s" as it's already a target`, l.name, copyToTarget)
+			}
+			if fromBackend.Type == toBackend.Type && ArrayContains(incompatibleCopySourceTarget, fromBackend.Type) {
+				return fmt.Errorf(`location "%s" cannot copy from "%s" to "%s" as both backends are of same type "%s" and environment variables would clash`, l.name, copyFrom, copyToTarget, fromBackend.Type)
 			}
 		}
 	}
@@ -275,20 +284,26 @@ func (l Location) Backup(cron bool, specificBackend string) []error {
 		// Copy
 		if md.SnapshotID != "" {
 			for copyFrom, copyTo := range l.CopyOption {
-				b1, _ := GetBackend(copyFrom)
-				for _, copyToTarget := range copyTo {
-					b2, _ := GetBackend(copyToTarget)
-					colors.Secondary.Println("Copying " + copyFrom + " → " + copyToTarget)
-					env, _ := b1.getEnv()
-					env2, _ := b2.getEnv()
-					// Add the second repo to the env with a "2" suffix
-					for k, v := range env2 {
-						env[k+"2"] = v
+				from, _ := GetBackend(copyFrom)
+				fromEnv, _ := from.getEnv()
+				// Rename RESTIC_* envvars to RESTIC_FROM_*
+				for _, k := range slices.Collect(maps.Keys(fromEnv)) {
+					if strings.HasPrefix(k, "RESTIC_") {
+						v := fromEnv[k]
+						delete(fromEnv, k)
+						fromEnv[strings.Replace(k, "RESTIC_", "RESTIC_FROM_", 1)] = v
 					}
+				}
+				for _, copyToTarget := range copyTo {
+					to, _ := GetBackend(copyToTarget)
+					colors.Secondary.Println("Copying " + copyFrom + " → " + copyToTarget)
+					toEnv, _ := to.getEnv()
+					finalEnv := make(map[string]string)
+					maps.Copy(finalEnv, fromEnv)
+					maps.Copy(finalEnv, toEnv)
 					_, _, err := ExecuteResticCommand(ExecuteOptions{
-						Envs: env,
+						Envs: finalEnv,
 					}, "copy", md.SnapshotID)
-
 					if err != nil {
 						errors = append(errors, err)
 					}
@@ -305,7 +320,7 @@ func (l Location) Backup(cron bool, specificBackend string) []error {
 after:
 	// Success/failure hooks
 	var commands []string
-	var isSuccess = len(errors) == 0
+	isSuccess := len(errors) == 0
 	if isSuccess {
 		commands = l.Hooks.Success
 	} else {
